@@ -1,0 +1,160 @@
+name: Build VESPER
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  engine-test:
+    name: Chord engine self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project
+        shell: bash
+        run: |
+          set -e
+          mkdir -p src
+          ZIP=$(find . -path ./src -prune -o -path ./.git -prune -o -type f -iname '*.zip' -print | head -n 1)
+          if [ -n "$ZIP" ]; then
+            echo "Unpacking $ZIP"
+            (cd src && cmake -E tar xf "../$ZIP")
+          else
+            echo "No zip found - using the files in the repo"
+            for f in CMakeLists.txt core plugin tests packaging; do if [ -e "$f" ]; then cp -R "$f" src/; fi; done
+          fi
+          if [ ! -f src/CMakeLists.txt ]; then
+            INNER=$(find src -maxdepth 3 -name CMakeLists.txt | head -n 1)
+            if [ -n "$INNER" ]; then cp -R "$(dirname "$INNER")"/. src/; fi
+          fi
+          if [ ! -f src/CMakeLists.txt ]; then
+            echo "::error::Couldn't find the VESPER project. Upload VESPER_project.zip to the repo (Add file > Upload files > Commit changes)."
+            exit 1
+          fi
+
+      - name: Build and run the self-test
+        run: |
+          g++ -std=c++17 -O2 -o selftest src/tests/selftest.cpp src/core/*.cpp
+          ./selftest
+
+  windows:
+    name: Windows VST3 + installer
+    runs-on: windows-latest
+    needs: engine-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project
+        shell: bash
+        run: |
+          set -e
+          mkdir -p src
+          ZIP=$(find . -path ./src -prune -o -path ./.git -prune -o -type f -iname '*.zip' -print | head -n 1)
+          if [ -n "$ZIP" ]; then
+            echo "Unpacking $ZIP"
+            (cd src && cmake -E tar xf "../$ZIP")
+          else
+            echo "No zip found - using the files in the repo"
+            for f in CMakeLists.txt core plugin tests packaging; do if [ -e "$f" ]; then cp -R "$f" src/; fi; done
+          fi
+          if [ ! -f src/CMakeLists.txt ]; then
+            INNER=$(find src -maxdepth 3 -name CMakeLists.txt | head -n 1)
+            if [ -n "$INNER" ]; then cp -R "$(dirname "$INNER")"/. src/; fi
+          fi
+          if [ ! -f src/CMakeLists.txt ]; then
+            echo "::error::Couldn't find the VESPER project. Upload VESPER_project.zip to the repo (Add file > Upload files > Commit changes)."
+            exit 1
+          fi
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S src -B build -G "Visual Studio 18 2026" -A x64 -DVESPER_BUILD_TOOLS=OFF
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Visual Studio 2026 not found, using 2022"
+            Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+            cmake -S src -B build -G "Visual Studio 17 2022" -A x64 -DVESPER_BUILD_TOOLS=OFF
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+
+      - name: Build VST3
+        run: cmake --build build --config Release --target VESPER_VST3 --parallel
+
+      - name: Collect (plugin + INSTALL.bat + read-me)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item -Recurse "build/VESPER_artefacts/Release/VST3/VESPER.vst3" "dist/VESPER.vst3"
+          Copy-Item "src/packaging/INSTALL.bat" "dist/INSTALL.bat"
+          Copy-Item "src/packaging/READ-ME-FIRST.txt" "dist/READ-ME-FIRST.txt"
+          if (-not (Test-Path "dist/INSTALL.bat")) { Write-Host "::error::INSTALL.bat missing"; exit 1 }
+
+      - name: Make VESPER-Setup.exe (bonus installer)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y | Out-Null }
+          if (-not (Test-Path $iscc)) { Write-Host "Inno Setup not available - INSTALL.bat is in the download"; exit 0 }
+          & $iscc "/DSrcDir=$PWD\dist" "/O$PWD\dist" "src\packaging\VESPER.iss"
+          Get-ChildItem dist | Select-Object Name, Length
+
+      - name: Upload (this is the download on the run page)
+        uses: actions/upload-artifact@v4
+        with:
+          name: VESPER-windows
+          path: dist/
+          if-no-files-found: error
+
+  mac:
+    name: macOS VST3 + AU
+    runs-on: macos-latest
+    needs: engine-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project
+        shell: bash
+        run: |
+          set -e
+          mkdir -p src
+          ZIP=$(find . -path ./src -prune -o -path ./.git -prune -o -type f -iname '*.zip' -print | head -n 1)
+          if [ -n "$ZIP" ]; then
+            echo "Unpacking $ZIP"
+            (cd src && cmake -E tar xf "../$ZIP")
+          else
+            echo "No zip found - using the files in the repo"
+            for f in CMakeLists.txt core plugin tests packaging; do if [ -e "$f" ]; then cp -R "$f" src/; fi; done
+          fi
+          if [ ! -f src/CMakeLists.txt ]; then
+            INNER=$(find src -maxdepth 3 -name CMakeLists.txt | head -n 1)
+            if [ -n "$INNER" ]; then cp -R "$(dirname "$INNER")"/. src/; fi
+          fi
+          if [ ! -f src/CMakeLists.txt ]; then
+            echo "::error::Couldn't find the VESPER project. Upload VESPER_project.zip to the repo (Add file > Upload files > Commit changes)."
+            exit 1
+          fi
+
+      - name: Configure (Intel + Apple Silicon)
+        run: cmake -S src -B build -G Xcode -DVESPER_BUILD_TOOLS=OFF -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+
+      - name: Build
+        run: cmake --build build --config Release --target VESPER_VST3 VESPER_AU --parallel
+
+      - name: Collect and sign (ad-hoc)
+        run: |
+          mkdir -p dist
+          cp -R build/VESPER_artefacts/Release/VST3/VESPER.vst3 dist/
+          cp -R build/VESPER_artefacts/Release/AU/VESPER.component dist/
+          codesign --force --deep -s - dist/VESPER.vst3
+          codesign --force --deep -s - dist/VESPER.component
+          cp src/packaging/INSTALL-Mac.command src/packaging/READ-ME-FIRST.txt dist/
+          chmod +x dist/INSTALL-Mac.command
+
+      - name: Upload (this is the download on the run page)
+        uses: actions/upload-artifact@v4
+        with:
+          name: VESPER-mac
+          path: dist/
+          if-no-files-found: error
