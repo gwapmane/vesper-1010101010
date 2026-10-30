@@ -107,10 +107,18 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+
+  # ----------------------------------------------------------------------------------------------
+  # Mac, built the way that worked for INCEPT on a 2017 Intel MacBook Pro (Ventura, FL 21):
+  # Intel-native, installed into the Mac's system plugin folders, wrapped in VESPER-Installer.pkg.
+  # It also installs itself on a real Intel Mac in the cloud and checks that it loads.
+  # ----------------------------------------------------------------------------------------------
   mac:
-    name: macOS VST3 + AU
-    runs-on: macos-latest
+    name: Mac (Intel) installer
+    runs-on: macos-15-intel
     needs: engine-test
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -136,25 +144,123 @@ jobs:
             exit 1
           fi
 
-      - name: Configure (Intel + Apple Silicon)
-        run: cmake -S src -B build -G Xcode -DVESPER_BUILD_TOOLS=OFF -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
-
-      - name: Build
-        run: cmake --build build --config Release --target VESPER_VST3 VESPER_AU --parallel
-
-      - name: Collect and sign (ad-hoc)
+      - name: Build (Intel-native, like a 2017 MacBook Pro)
         run: |
-          mkdir -p dist
-          cp -R build/VESPER_artefacts/Release/VST3/VESPER.vst3 dist/
-          cp -R build/VESPER_artefacts/Release/AU/VESPER.component dist/
-          codesign --force --deep -s - dist/VESPER.vst3
-          codesign --force --deep -s - dist/VESPER.component
-          cp src/packaging/INSTALL-Mac.command src/packaging/READ-ME-FIRST.txt dist/
-          chmod +x dist/INSTALL-Mac.command
+          mkdir -p out
+          set -o pipefail
+          cmake -S src -B build -DCMAKE_BUILD_TYPE=Release -DVESPER_BUILD_TOOLS=OFF \
+                -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 2>&1 | tee out/build-log.txt
+          cmake --build build --config Release --parallel 4 --target VESPER_VST3 VESPER_AU 2>&1 | tail -200 | tee -a out/build-log.txt
 
-      - name: Upload (this is the download on the run page)
+      - name: Sign (ad-hoc)
+        run: |
+          mkdir -p stage
+          for name in VESPER.vst3 VESPER.component; do
+            found=$(find build -maxdepth 6 -name "$name" -type d | head -1)
+            if [ -z "$found" ]; then echo "::error::$name was not built"; exit 1; fi
+            codesign --force --deep --sign - "$found"
+            cp -R "$found" stage/
+          done
+
+      - name: Make VESPER-Installer.pkg
+        run: |
+          set -e
+          ROOT=pkgroot
+          mkdir -p "$ROOT/Library/Audio/Plug-Ins/VST3" "$ROOT/Library/Audio/Plug-Ins/Components" scripts out
+          cp -R stage/VESPER.vst3 "$ROOT/Library/Audio/Plug-Ins/VST3/"
+          cp -R stage/VESPER.component "$ROOT/Library/Audio/Plug-Ins/Components/"
+
+          cat > scripts/preinstall <<'SH'
+          #!/bin/bash
+          # remove older copies, including ones the old INSTALL-Mac.command put in the user's own Library
+          rm -rf "/Library/Audio/Plug-Ins/VST3/VESPER.vst3" "/Library/Audio/Plug-Ins/Components/VESPER.component"
+          U=$(stat -f%Su /dev/console 2>/dev/null)
+          if [ -n "$U" ] && [ "$U" != "root" ]; then
+            H=$(dscl . -read "/Users/$U" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+            if [ -n "$H" ]; then
+              rm -rf "$H/Library/Audio/Plug-Ins/VST3/VESPER.vst3" "$H/Library/Audio/Plug-Ins/Components/VESPER.component"
+            fi
+          fi
+          exit 0
+          SH
+
+          cat > scripts/postinstall <<'SH'
+          #!/bin/bash
+          # clear the "downloaded from the internet" mark so FL is allowed to load it, and refresh the AU list
+          xattr -cr "/Library/Audio/Plug-Ins/VST3/VESPER.vst3" 2>/dev/null
+          xattr -cr "/Library/Audio/Plug-Ins/Components/VESPER.component" 2>/dev/null
+          killall -9 AudioComponentRegistrar 2>/dev/null
+          exit 0
+          SH
+          chmod +x scripts/preinstall scripts/postinstall
+
+          # install exactly into /Library/Audio/Plug-Ins, even if an older copy sits somewhere else
+          pkgbuild --analyze --root "$ROOT" comp.plist
+          i=0
+          while /usr/libexec/PlistBuddy -c "Print :$i" comp.plist >/dev/null 2>&1; do
+            /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" comp.plist
+            i=$((i+1))
+          done
+          pkgbuild --root "$ROOT" --component-plist comp.plist --scripts scripts \
+                   --identifier com.gwapmane.vesper --version 1.5.0 --install-location / vesper-component.pkg
+          productbuild --package vesper-component.pkg out/VESPER-Installer.pkg
+
+          cat > out/READ-ME-MAC.txt <<'TXT'
+          VESPER for Mac (Intel)
+          ======================
+          1. Double-click VESPER-Installer.pkg.
+             If the Mac says it's from an unidentified developer: right-click it > Open > Open.
+             (Or: System Settings > Privacy & Security > scroll down > Open Anyway.)
+          2. Click Continue / Install and type your Mac password.
+             It replaces any older VESPER, including copies from the old INSTALL-Mac.command.
+          3. Quit FL Studio completely and open it again.
+          4. FL Studio: Options > Manage plugins > Find installed plugins (leave "Verify plugins" ticked).
+          5. VESPER is an instrument: add it from the Channel rack (+). You may see it twice
+             (VST3 and AU). Either one works.
+          TXT
+          ls -la out
+
+      - name: Self-test - install it on this Mac and check it loads
+        continue-on-error: true
+        run: |
+          R=out/mac-test-report.txt
+          {
+            echo "== cloud Mac =="; sw_vers; uname -m
+            echo; echo "== installing VESPER-Installer.pkg =="
+            sudo installer -pkg out/VESPER-Installer.pkg -target / 2>&1
+            echo; echo "== installed files =="
+            ls -la /Library/Audio/Plug-Ins/VST3/VESPER.vst3/Contents/MacOS /Library/Audio/Plug-Ins/Components/VESPER.component/Contents/MacOS 2>&1
+            exe=/Library/Audio/Plug-Ins/VST3/VESPER.vst3/Contents/MacOS/VESPER
+            echo; echo "-- architectures:"; lipo -info "$exe" 2>&1
+            echo "-- minimum macOS:"; otool -l "$exe" | grep -A4 -E "LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX" | head -6
+            echo "-- signature check:"; codesign --verify --deep --strict --verbose=2 /Library/Audio/Plug-Ins/VST3/VESPER.vst3 2>&1 | head -4
+            echo; echo "== Audio Unit check (auval) =="
+            killall -9 AudioComponentRegistrar 2>/dev/null || true; sleep 3
+            auval -a 2>&1 | grep -i -E "vesper|Vspr" || echo "VESPER not listed by auval"
+            auval -v aumu Vchd Vspr 2>&1 | tail -25
+            echo; echo "== VST3 check (pluginval) =="
+            curl -sL -o pv.zip https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_macOS.zip && unzip -q -o pv.zip
+            ./pluginval.app/Contents/MacOS/pluginval --strictness-level 5 --skip-gui-tests --validate-in-process \
+              /Library/Audio/Plug-Ins/VST3/VESPER.vst3 2>&1 | tail -30
+          } > "$R" 2>&1
+          cat "$R"
+
+      - name: Upload (also on the run page)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: VESPER-mac
-          path: dist/
-          if-no-files-found: error
+          path: out/
+          if-no-files-found: ignore
+
+      # Releases page: VESPER-Installer.pkg as a direct download, plus the reports
+      - name: Publish to Releases
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="vesper-mac"
+          echo "${{ job.status }}" > out/status.txt
+          gh release delete "$TAG" -y --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" out/* --target "$GITHUB_SHA" --title "VESPER for Mac (Intel)" \
+            --notes "Download VESPER-Installer.pkg, right-click > Open, then Install. Rescan plugins in FL Studio." --prerelease
