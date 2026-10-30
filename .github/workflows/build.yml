@@ -109,12 +109,13 @@ jobs:
 
 
   # ----------------------------------------------------------------------------------------------
-  # Mac, built the way that worked for INCEPT on a 2017 Intel MacBook Pro (Ventura, FL 21):
-  # Intel-native, installed into the Mac's system plugin folders, wrapped in VESPER-Installer.pkg.
-  # It also installs itself on a real Intel Mac in the cloud and checks that it loads.
+  # Mac: one installer for BOTH kinds of Mac (older Intel ones like a 2017 MacBook Pro, and newer
+  # Apple Silicon M1/M2/M3/M4 ones). Built on an Intel Mac exactly like the build that worked in FL,
+  # plus an Apple Silicon half; installed into the system plugin folders by VESPER-Installer.pkg.
+  # It then installs itself on a real Intel Mac AND a real Apple Silicon Mac in the cloud and checks it loads.
   # ----------------------------------------------------------------------------------------------
   mac:
-    name: Mac (Intel) installer
+    name: Mac installer (Intel + Apple Silicon)
     runs-on: macos-15-intel
     needs: engine-test
     permissions:
@@ -144,12 +145,12 @@ jobs:
             exit 1
           fi
 
-      - name: Build (Intel-native, like a 2017 MacBook Pro)
+      - name: Build (Intel + Apple Silicon in one plugin)
         run: |
           mkdir -p out
           set -o pipefail
           cmake -S src -B build -DCMAKE_BUILD_TYPE=Release -DVESPER_BUILD_TOOLS=OFF \
-                -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 2>&1 | tee out/build-log.txt
+                "-DCMAKE_OSX_ARCHITECTURES=x86_64;arm64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 2>&1 | tee out/build-log.txt
           cmake --build build --config Release --parallel 4 --target VESPER_VST3 VESPER_AU 2>&1 | tail -200 | tee -a out/build-log.txt
 
       - name: Sign (ad-hoc)
@@ -216,7 +217,7 @@ jobs:
           productbuild --distribution distribution.xml --package-path . out/VESPER-Installer.pkg
           pkgutil --payload-files out/VESPER-Installer.pkg | head -20 || true
 
-          printf '%s\n' 'VESPER for Mac (Intel)' '======================' \
+          printf '%s\n' 'VESPER for Mac (Intel and Apple Silicon)' '========================================' \
             '1. Double-click VESPER-Installer.pkg.' \
             '   If the Mac says it is from an unidentified developer: right-click it > Open > Open.' \
             '   (Or: System Settings > Privacy & Security > scroll down > Open Anyway.)' \
@@ -224,7 +225,15 @@ jobs:
             '   It replaces any older VESPER, including copies from the old INSTALL-Mac.command.' \
             '3. Quit FL Studio completely and open it again.' \
             '4. FL Studio: Options > Manage plugins > Find installed plugins (leave "Verify plugins" ticked).' \
-            '5. VESPER is an instrument: add it from the Channel rack (+). You may see it twice (VST3 and AU). Either one works.' \
+            '   VESPER is an instrument: add it from the Channel rack (+). You may see it twice (VST3 and AU). Either one works.' \
+            '   Ableton Live: Settings > Plug-Ins > turn on "Use Audio Units v2" and "Use VST3 Plug-In System Folders",' \
+            '   click Rescan. VESPER is under Plug-Ins (VST3 or Audio Units).' \
+            '' \
+            'ABLETON: PLAY YOUR OTHER INSTRUMENTS WITH VESPER' \
+            '1. Put VESPER on a MIDI track and arm it (or set Monitor to In).' \
+            '2. On a second MIDI track with your synth: MIDI From = the VESPER track, and in the box under it pick VESPER' \
+            '   (not Pre FX / Post FX). Set that track Monitor = In.' \
+            '3. Turn KEYS SOUND off in VESPER so you only hear your synth.' \
             > out/READ-ME-MAC.txt
           ls -la out
 
@@ -270,5 +279,35 @@ jobs:
           TAG="vesper-mac"
           echo "${{ job.status }}" > out/status.txt
           gh release delete "$TAG" -y --cleanup-tag 2>/dev/null || true
-          gh release create "$TAG" out/* --target "$GITHUB_SHA" --title "VESPER for Mac (Intel)" \
-            --notes "Download VESPER-Installer.pkg, right-click > Open, then Install. Rescan plugins in FL Studio." --prerelease
+          gh release create "$TAG" out/* --target "$GITHUB_SHA" --title "VESPER for Mac (Intel + Apple Silicon)" \
+            --notes "Download VESPER-Installer.pkg, right-click > Open, then Install. Rescan plugins in FL Studio or Ableton. Works on Intel and Apple Silicon Macs." --prerelease
+
+  # installs the same VESPER-Installer.pkg on a real Apple Silicon Mac and checks it loads there too
+  mac-apple-silicon-test:
+    name: Test on Apple Silicon Mac
+    runs-on: macos-15
+    needs: mac
+    permissions:
+      contents: write
+    steps:
+      - name: Install and check
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          R=apple-silicon-test-report.txt
+          {
+            echo "== cloud Mac =="; sw_vers; uname -m
+            gh release download vesper-mac -R "$GITHUB_REPOSITORY" -p VESPER-Installer.pkg -D . --clobber
+            echo; echo "== installing VESPER-Installer.pkg =="
+            sudo installer -pkg VESPER-Installer.pkg -target / 2>&1
+            exe=/Library/Audio/Plug-Ins/VST3/VESPER.vst3/Contents/MacOS/VESPER
+            echo; echo "-- architectures:"; lipo -info "$exe" 2>&1
+            echo "-- signature check:"; codesign --verify --deep --strict --verbose=2 /Library/Audio/Plug-Ins/VST3/VESPER.vst3 2>&1 | head -4
+            echo; echo "== Audio Unit check (auval) =="
+            killall -9 AudioComponentRegistrar 2>/dev/null || true; sleep 3
+            auval -a 2>&1 | grep -i -E "vesper|Vspr" || echo "VESPER not listed by auval"
+            auval -v aumu Vchd Vspr 2>&1 | tail -25
+          } > "$R" 2>&1
+          cat "$R"
+          gh release upload vesper-mac "$R" -R "$GITHUB_REPOSITORY" --clobber
