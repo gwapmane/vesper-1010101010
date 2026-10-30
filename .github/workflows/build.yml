@@ -164,60 +164,68 @@ jobs:
 
       - name: Make VESPER-Installer.pkg
         run: |
-          set -e
-          ROOT=pkgroot
-          mkdir -p "$ROOT/Library/Audio/Plug-Ins/VST3" "$ROOT/Library/Audio/Plug-Ins/Components" scripts out
-          cp -R stage/VESPER.vst3 "$ROOT/Library/Audio/Plug-Ins/VST3/"
-          cp -R stage/VESPER.component "$ROOT/Library/Audio/Plug-Ins/Components/"
+          mkdir -p out
+          exec > >(tee -a out/pkg-log.txt) 2>&1   # everything below also lands in pkg-log.txt on the Releases page
+          set -ex
 
-          cat > scripts/preinstall <<'SH'
-          #!/bin/bash
-          # remove older copies, including ones the old INSTALL-Mac.command put in the user's own Library
-          rm -rf "/Library/Audio/Plug-Ins/VST3/VESPER.vst3" "/Library/Audio/Plug-Ins/Components/VESPER.component"
-          U=$(stat -f%Su /dev/console 2>/dev/null)
-          if [ -n "$U" ] && [ "$U" != "root" ]; then
-            H=$(dscl . -read "/Users/$U" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
-            if [ -n "$H" ]; then
-              rm -rf "$H/Library/Audio/Plug-Ins/VST3/VESPER.vst3" "$H/Library/Audio/Plug-Ins/Components/VESPER.component"
-            fi
-          fi
-          exit 0
-          SH
+          # one package per plugin format, each installed straight into the Mac's system plugin folder
+          mkdir -p rootV rootA scriptsV scriptsA
+          cp -R stage/VESPER.vst3 rootV/
+          cp -R stage/VESPER.component rootA/
 
-          cat > scripts/postinstall <<'SH'
-          #!/bin/bash
-          # clear the "downloaded from the internet" mark so FL is allowed to load it, and refresh the AU list
-          xattr -cr "/Library/Audio/Plug-Ins/VST3/VESPER.vst3" 2>/dev/null
-          xattr -cr "/Library/Audio/Plug-Ins/Components/VESPER.component" 2>/dev/null
-          killall -9 AudioComponentRegistrar 2>/dev/null
-          exit 0
-          SH
-          chmod +x scripts/preinstall scripts/postinstall
-
-          # install exactly into /Library/Audio/Plug-Ins, even if an older copy sits somewhere else
-          pkgbuild --analyze --root "$ROOT" comp.plist
-          i=0
-          while /usr/libexec/PlistBuddy -c "Print :$i" comp.plist >/dev/null 2>&1; do
-            /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" comp.plist
-            i=$((i+1))
+          # never "relocate" onto an older copy somewhere else on the Mac: always install exactly here
+          for f in VESPER.vst3:v.plist VESPER.component:a.plist; do
+            bundle=${f%%:*}; out=${f##*:}
+            printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+              '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+              '<plist version="1.0"><array><dict>' \
+              '<key>BundleHasStrictIdentifier</key><false/>' \
+              '<key>BundleIsRelocatable</key><false/>' \
+              '<key>BundleIsVersionChecked</key><false/>' \
+              '<key>BundleOverwriteAction</key><string>upgrade</string>' \
+              "<key>RootRelativeBundlePath</key><string>$bundle</string>" \
+              '</dict></array></plist>' > "$out"
+            plutil -lint "$out"
           done
-          pkgbuild --root "$ROOT" --component-plist comp.plist --scripts scripts \
-                   --identifier com.gwapmane.vesper --version 1.5.0 --install-location / vesper-component.pkg
-          productbuild --package vesper-component.pkg out/VESPER-Installer.pkg
 
-          cat > out/READ-ME-MAC.txt <<'TXT'
-          VESPER for Mac (Intel)
-          ======================
-          1. Double-click VESPER-Installer.pkg.
-             If the Mac says it's from an unidentified developer: right-click it > Open > Open.
-             (Or: System Settings > Privacy & Security > scroll down > Open Anyway.)
-          2. Click Continue / Install and type your Mac password.
-             It replaces any older VESPER, including copies from the old INSTALL-Mac.command.
-          3. Quit FL Studio completely and open it again.
-          4. FL Studio: Options > Manage plugins > Find installed plugins (leave "Verify plugins" ticked).
-          5. VESPER is an instrument: add it from the Channel rack (+). You may see it twice
-             (VST3 and AU). Either one works.
-          TXT
+          # before installing: remove older copies, including ones the old INSTALL-Mac.command put in the user's own Library
+          printf '%s\n' '#!/bin/bash' \
+            'rm -rf "/Library/Audio/Plug-Ins/VST3/VESPER.vst3" "/Library/Audio/Plug-Ins/Components/VESPER.component"' \
+            'U=$(stat -f%Su /dev/console 2>/dev/null)' \
+            'if [ -n "$U" ] && [ "$U" != "root" ]; then' \
+            '  H=$(dscl . -read "/Users/$U" NFSHomeDirectory 2>/dev/null | awk "{print \$2}")' \
+            '  if [ -n "$H" ]; then rm -rf "$H/Library/Audio/Plug-Ins/VST3/VESPER.vst3" "$H/Library/Audio/Plug-Ins/Components/VESPER.component"; fi' \
+            'fi' \
+            'exit 0' > scriptsV/preinstall
+          # after installing: clear the "downloaded from the internet" mark so FL may load it; refresh the AU list
+          printf '%s\n' '#!/bin/bash' \
+            'xattr -cr "/Library/Audio/Plug-Ins/VST3/VESPER.vst3" 2>/dev/null' \
+            'exit 0' > scriptsV/postinstall
+          printf '%s\n' '#!/bin/bash' \
+            'xattr -cr "/Library/Audio/Plug-Ins/Components/VESPER.component" 2>/dev/null' \
+            'killall -9 AudioComponentRegistrar 2>/dev/null' \
+            'exit 0' > scriptsA/postinstall
+          chmod +x scriptsV/* scriptsA/*
+          bash -n scriptsV/preinstall && bash -n scriptsV/postinstall && bash -n scriptsA/postinstall
+
+          pkgbuild --root rootV --component-plist v.plist --scripts scriptsV --identifier com.gwapmane.vesper.vst3 \
+                   --version 1.5.0 --install-location /Library/Audio/Plug-Ins/VST3 VESPER-vst3.pkg
+          pkgbuild --root rootA --component-plist a.plist --scripts scriptsA --identifier com.gwapmane.vesper.au \
+                   --version 1.5.0 --install-location /Library/Audio/Plug-Ins/Components VESPER-au.pkg
+          productbuild --synthesize --package VESPER-vst3.pkg --package VESPER-au.pkg distribution.xml
+          productbuild --distribution distribution.xml --package-path . out/VESPER-Installer.pkg
+          pkgutil --payload-files out/VESPER-Installer.pkg | head -20 || true
+
+          printf '%s\n' 'VESPER for Mac (Intel)' '======================' \
+            '1. Double-click VESPER-Installer.pkg.' \
+            '   If the Mac says it is from an unidentified developer: right-click it > Open > Open.' \
+            '   (Or: System Settings > Privacy & Security > scroll down > Open Anyway.)' \
+            '2. Click Continue / Install and type your Mac password.' \
+            '   It replaces any older VESPER, including copies from the old INSTALL-Mac.command.' \
+            '3. Quit FL Studio completely and open it again.' \
+            '4. FL Studio: Options > Manage plugins > Find installed plugins (leave "Verify plugins" ticked).' \
+            '5. VESPER is an instrument: add it from the Channel rack (+). You may see it twice (VST3 and AU). Either one works.' \
+            > out/READ-ME-MAC.txt
           ls -la out
 
       - name: Self-test - install it on this Mac and check it loads
